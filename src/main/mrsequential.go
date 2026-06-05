@@ -6,13 +6,16 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
-import "6.5840/mr"
-import "plugin"
-import "os"
-import "log"
-import "io/ioutil"
-import "sort"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"plugin"
+	"sort"
+
+	"6.5840/mr"
+)
 
 // for sorting by key.
 type ByKey []mr.KeyValue
@@ -31,9 +34,9 @@ func main() {
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
-	// read each input file,
+	// read each input file (Map Function input),
 	// pass it to Map,
-	// accumulate the intermediate Map output.
+	// accumulate the intermediate Map output (Reduce function input).
 	//
 	intermediate := []mr.KeyValue{}
 	for _, filename := range os.Args[2:] {
@@ -67,11 +70,13 @@ func main() {
 	//
 	i := 0
 	for i < len(intermediate) {
-		j := i + 1
+		j := i + 1 // number of key count ?
+		//compares the current and subsequent keys and incremnet j if they are the same
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
 		}
 		values := []string{}
+		//saves them in value
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}

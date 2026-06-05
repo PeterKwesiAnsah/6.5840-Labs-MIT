@@ -1,11 +1,68 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
+import (
+	"fmt"
+	"hash/fnv"
+	"net/rpc"
+	"sync"
+	"time"
+)
 
+var activeMaxMapTasks int = 8
+var failedConns int = 0
+
+type taskState int
+
+// 2. Use iota to auto-increment values
+const (
+	active taskState = iota
+	idle
+)
+
+type workerTask struct {
+	state   taskState
+	payload Task
+	}
+
+type workerTasks struct {
+	mu sync.Mutex
+	ch chan struct {
+		client *rpc.Client
+	}
+	tasks []workerTask
+	idle int
+	active int
+	//??
+	len int
+}
+
+func (wT *workerTasks) incrActive(){
+	wT.active++
+}
+func (wT *workerTasks) decrActive(){
+	wT.active--
+}
+func (wT *workerTasks) incrIdle(){
+	wT.idle++
+}
+func (wT *workerTasks) decrIdle(){
+	wT.idle--
+}
+func (wT *workerTasks) addTask(t workerTask){
+	wT.tasks=append(wT.tasks,t)
+}
+func (wT *workerTasks) setTaskStatus(t TaskId, status taskState){
+	wT.tasks[t].state=status
+}
+func (wT *workerTasks) setTaskPayload(t TaskId, payload Task){
+	wT.tasks[t].payload=payload
+}
+
+
+const (
+	StatusSuccess = "success"
+	StatusError   = "error"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -23,61 +80,147 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
+// A reasonable naming convention for intermediate files is mr-X-Y, where X is the Map task number, and Y is the reduce task number.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	coordSockName = sockname
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	var tasks workerTasks = workerTasks{ch: make(chan struct {
+        client *rpc.Client
+    }),
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+	var done bool = false
+	// This go routine will check the status of the job
+	go func(status *bool) {
+		for {
+			if *status {
+				break
+			}
+			c, err := connectrpc()
+			if err != nil {
+				fmt.Printf(fmt.Errorf("Client Connection Failed for Job Status Check: %v\n", err).Error())
+				// How many retries before we give up
+				continue
+			}
+			err = callrpc(c, "Coordinator.JobStatus", 0, status)
+			if err != nil {
+				fmt.Printf(fmt.Errorf("RPC Failed: %v\n", err).Error())
+				// How many retries before we give up
+				c.Close()
+				continue
+			}
+		}
+	}(&done)
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	// Each finished map task need to tell the co-ordinator
+	// The only one that knows if the job is done is the co-ordinator
+	for {
+		if done {
+			break
+		}
+		c, err := connectrpc()
+		if err != nil {
+			fmt.Printf(fmt.Errorf("Client Connection Failed: %v\n", err).Error())
+			// How many retries before we give up
+			continue
+		}
+		//use an idle thread or spawn a new one
+	FIND_A_THREAD:
+tasks.mu.Lock()
+		lenIdle := tasks.idle
+		lenActive := tasks.active
+tasks.mu.Unlock()
+	
+		if lenActive == activeMaxMapTasks {
+			time.Sleep(time.Second)
+			goto FIND_A_THREAD
+		} else if lenIdle != 0 {
+			// wake up exactly one sleeping worker...we can't know or tell which woke up
+			go func(client *rpc.Client) {
+				tasks.ch <- struct {
+					client *rpc.Client
+				}{
+					client,
+				}
+			}(c)
+		continue
+		}
+	
+		tasks.mu.Lock()
+		tasks.addTask(workerTask{state:active})
+		tasks.incrActive()
+		tasks.mu.Unlock()
 
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		var taskId TaskId = TaskId(lenActive)
+		fmt.Printf("Spawning Client Worker Task %d\n", taskId)
+		go func(client *rpc.Client, taskId TaskId, status *bool) {
+			defer func() {
+				// we can check for crashes and handle appropiately
+				// died go routines are neither idle / active		
+				tasks.mu.Lock()
+					tasks.decrIdle()
+					tasks.decrActive()
+				tasks.mu.Unlock()
+			}()
+			for {
+				var path Task
+				err := callrpc(client, "Coordinator.GetTask", int(taskId), &path)
+				if err != nil {
+					fmt.Printf(fmt.Errorf("Task Id %d: %v\n", taskId, err).Error())
+					if err.Error()=="EEMPTY"{
+						*status=true
+					}
+					return
+				}
+				//do work with Task
+				c.Close()
+				fmt.Printf("Client Worker Task %d just finished with %s\n", taskId, path.Path)
+				// report when finished, have a service name to report task finish
+				// active -> idle
+				tasks.mu.Lock()
+					tasks.setTaskPayload(taskId,path)
+					tasks.setTaskStatus(taskId,idle)
+					tasks.incrIdle()
+					tasks.decrActive()
+				tasks.mu.Unlock()
+				
+				fmt.Printf("Sleeping Client Worker Task %d\n", taskId)
+				v := <-tasks.ch
+				// woke up
+				client = v.client
+				fmt.Printf("Waking up Client Worker Task %d\n", taskId)
+				// idle -> active
+				tasks.mu.Lock()
+					tasks.setTaskStatus(taskId,active)
+					tasks.decrIdle()
+					tasks.incrActive()
+				tasks.mu.Unlock()
+			}
+		}(c, taskId, &done)
 	}
+	// reducers
+	println("Job Done")
+
 }
 
 // send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+func callrpc(c *rpc.Client, rpcname string, arg any, reply any) error {
+	err := c.Call(rpcname, arg, reply)
+	//blocking
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func connectrpc() (*rpc.Client, error) {
 	c, err := rpc.DialHTTP("unix", coordSockName)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		return nil, err
 	}
-	defer c.Close()
-
-	if err := c.Call(rpcname, args, reply); err == nil {
-		return true
-	}
-	log.Printf("%d: call failed err %v", os.Getpid(), err)
-	return false
+	return c, nil
 }

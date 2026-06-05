@@ -11,13 +11,12 @@ package mr
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
-}
+type TaskId int
+type Args int
 
-type ExampleReply struct {
-	Y int
-}
+type TaskStatus bool
+type JobStatus bool
+
+type Task struct{ Path string }
 
 // Add your RPC definitions here.
-
