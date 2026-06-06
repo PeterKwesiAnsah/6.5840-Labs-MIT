@@ -22,42 +22,41 @@ const (
 type workerTask struct {
 	state   taskState
 	payload Task
-	}
+}
 
 type workerTasks struct {
 	mu sync.Mutex
 	ch chan struct {
 		client *rpc.Client
 	}
-	tasks []workerTask
-	idle int
+	tasks  []workerTask
+	idle   int
 	active int
 	//??
 	len int
 }
 
-func (wT *workerTasks) incrActive(){
+func (wT *workerTasks) incrActive() {
 	wT.active++
 }
-func (wT *workerTasks) decrActive(){
+func (wT *workerTasks) decrActive() {
 	wT.active--
 }
-func (wT *workerTasks) incrIdle(){
+func (wT *workerTasks) incrIdle() {
 	wT.idle++
 }
-func (wT *workerTasks) decrIdle(){
+func (wT *workerTasks) decrIdle() {
 	wT.idle--
 }
-func (wT *workerTasks) addTask(t workerTask){
-	wT.tasks=append(wT.tasks,t)
+func (wT *workerTasks) addTask(t workerTask) {
+	wT.tasks = append(wT.tasks, t)
 }
-func (wT *workerTasks) setTaskStatus(t TaskId, status taskState){
-	wT.tasks[t].state=status
+func (wT *workerTasks) setTaskStatus(t TaskId, status taskState) {
+	wT.tasks[t].state = status
 }
-func (wT *workerTasks) setTaskPayload(t TaskId, payload Task){
-	wT.tasks[t].payload=payload
+func (wT *workerTasks) setTaskPayload(t TaskId, payload Task) {
+	wT.tasks[t].payload = payload
 }
-
 
 const (
 	StatusSuccess = "success"
@@ -88,20 +87,26 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	coordSockName = sockname
 
 	var tasks workerTasks = workerTasks{ch: make(chan struct {
-        client *rpc.Client
-    }),
-}
+		client *rpc.Client
+	}),
+	}
 
 	var done bool = false
 	// This go routine will check the status of the job
 	go func(status *bool) {
+		connRetries := 0
+		rpcRetries := 0
 		for {
 			if *status {
 				break
 			}
+			if connRetries == 5 {
+				*status = true
+			}
 			c, err := connectrpc()
 			if err != nil {
 				fmt.Printf(fmt.Errorf("Client Connection Failed for Job Status Check: %v\n", err).Error())
+				connRetries++
 				// How many retries before we give up
 				continue
 			}
@@ -109,6 +114,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			if err != nil {
 				fmt.Printf(fmt.Errorf("RPC Failed: %v\n", err).Error())
 				// How many retries before we give up
+				rpcRetries++
 				c.Close()
 				continue
 			}
@@ -117,23 +123,29 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	// Each finished map task need to tell the co-ordinator
 	// The only one that knows if the job is done is the co-ordinator
+	connRetriesMapTasks := 0
 	for {
+
 		if done {
 			break
+		}
+		if connRetriesMapTasks == 5 {
+			done = true
 		}
 		c, err := connectrpc()
 		if err != nil {
 			fmt.Printf(fmt.Errorf("Client Connection Failed: %v\n", err).Error())
+			connRetriesMapTasks++
 			// How many retries before we give up
 			continue
 		}
 		//use an idle thread or spawn a new one
 	FIND_A_THREAD:
-tasks.mu.Lock()
+		tasks.mu.Lock()
 		lenIdle := tasks.idle
 		lenActive := tasks.active
-tasks.mu.Unlock()
-	
+		tasks.mu.Unlock()
+
 		if lenActive == activeMaxMapTasks {
 			time.Sleep(time.Second)
 			goto FIND_A_THREAD
@@ -146,11 +158,11 @@ tasks.mu.Unlock()
 					client,
 				}
 			}(c)
-		continue
+			continue
 		}
-	
+
 		tasks.mu.Lock()
-		tasks.addTask(workerTask{state:active})
+		tasks.addTask(workerTask{state: active})
 		tasks.incrActive()
 		tasks.mu.Unlock()
 
@@ -159,10 +171,10 @@ tasks.mu.Unlock()
 		go func(client *rpc.Client, taskId TaskId, status *bool) {
 			defer func() {
 				// we can check for crashes and handle appropiately
-				// died go routines are neither idle / active		
+				// died go routines are neither idle / active
 				tasks.mu.Lock()
-					tasks.decrIdle()
-					tasks.decrActive()
+				tasks.decrIdle()
+				tasks.decrActive()
 				tasks.mu.Unlock()
 			}()
 			for {
@@ -170,8 +182,8 @@ tasks.mu.Unlock()
 				err := callrpc(client, "Coordinator.GetTask", int(taskId), &path)
 				if err != nil {
 					fmt.Printf(fmt.Errorf("Task Id %d: %v\n", taskId, err).Error())
-					if err.Error()=="EEMPTY"{
-						*status=true
+					if err.Error() == "EEMPTY" {
+						*status = true
 					}
 					return
 				}
@@ -181,12 +193,12 @@ tasks.mu.Unlock()
 				// report when finished, have a service name to report task finish
 				// active -> idle
 				tasks.mu.Lock()
-					tasks.setTaskPayload(taskId,path)
-					tasks.setTaskStatus(taskId,idle)
-					tasks.incrIdle()
-					tasks.decrActive()
+				tasks.setTaskPayload(taskId, path)
+				tasks.setTaskStatus(taskId, idle)
+				tasks.incrIdle()
+				tasks.decrActive()
 				tasks.mu.Unlock()
-				
+
 				fmt.Printf("Sleeping Client Worker Task %d\n", taskId)
 				v := <-tasks.ch
 				// woke up
@@ -194,9 +206,9 @@ tasks.mu.Unlock()
 				fmt.Printf("Waking up Client Worker Task %d\n", taskId)
 				// idle -> active
 				tasks.mu.Lock()
-					tasks.setTaskStatus(taskId,active)
-					tasks.decrIdle()
-					tasks.incrActive()
+				tasks.setTaskStatus(taskId, active)
+				tasks.decrIdle()
+				tasks.incrActive()
 				tasks.mu.Unlock()
 			}
 		}(c, taskId, &done)
