@@ -17,6 +17,10 @@ type Args int
 type TaskStatus bool
 type JobStatus bool
 
-type Task struct{ Path string }
+type Task struct {
+	Path string
+	//number of reduce Tasks to reproduce
+	ReduceTasks int
+}
 
 // Add your RPC definitions here.
