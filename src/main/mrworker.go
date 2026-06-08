@@ -12,7 +12,9 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"plugin"
 
 	"6.5840/mr"
 )
@@ -23,29 +25,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	//mapf, reducef := loadPlugin(os.Args[1])
+	mapf, reducef := loadPlugin(os.Args[1])
 
-	mr.Worker(os.Args[2], nil, nil)
+	mr.Worker(os.Args[2], mapf, reducef)
 }
 
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
-// func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
-// 	p, err := plugin.Open(filename)
-// 	if err != nil {
-// 		log.Fatalf("cannot load plugin %v", filename)
-// 	}
-// 	xmapf, err := p.Lookup("Map")
-// 	if err != nil {
-// 		log.Fatalf("cannot find Map in %v", filename)
+func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
+	p, err := plugin.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot load plugin %v", filename)
+	}
+	xmapf, err := p.Lookup("Map")
+	if err != nil {
+		log.Fatalf("cannot find Map in %v", filename)
 
-// 	}
-// 	mapf := xmapf.(func(string, string) []mr.KeyValue)
-// 	xreducef, err := p.Lookup("Reduce")
-// 	if err != nil {
-// 		log.Fatalf("cannot find Reduce in %v", filename)
-// 	}
-// 	reducef := xreducef.(func(string, []string) string)
+	}
+	mapf := xmapf.(func(string, string) []mr.KeyValue)
+	xreducef, err := p.Lookup("Reduce")
+	if err != nil {
+		log.Fatalf("cannot find Reduce in %v", filename)
+	}
+	reducef := xreducef.(func(string, []string) string)
 
-// 	return mapf, reducef
-// }
+	return mapf, reducef
+}
