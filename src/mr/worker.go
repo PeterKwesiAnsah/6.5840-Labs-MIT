@@ -1,12 +1,24 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"log"
 	"net/rpc"
+	"os"
+	"sort"
 	"sync"
-	"time"
 )
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 var activeMaxMapTasks int = 8
 var failedConns int = 0
@@ -25,43 +37,8 @@ type workerTask struct {
 }
 
 type workerTasks struct {
-	mu sync.Mutex
-	ch chan struct {
-		client *rpc.Client
-	}
-	tasks  []workerTask
-	idle   int
-	active int
-	//??
-	len int
+	tasks []workerTask
 }
-
-func (wT *workerTasks) incrActive() {
-	wT.active++
-}
-func (wT *workerTasks) decrActive() {
-	wT.active--
-}
-func (wT *workerTasks) incrIdle() {
-	wT.idle++
-}
-func (wT *workerTasks) decrIdle() {
-	wT.idle--
-}
-func (wT *workerTasks) addTask(t workerTask) {
-	wT.tasks = append(wT.tasks, t)
-}
-func (wT *workerTasks) setTaskStatus(t TaskId, status taskState) {
-	wT.tasks[t].state = status
-}
-func (wT *workerTasks) setTaskPayload(t TaskId, payload Task) {
-	wT.tasks[t].payload = payload
-}
-
-const (
-	StatusSuccess = "success"
-	StatusError   = "error"
-)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -86,10 +63,13 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	coordSockName = sockname
 
-	var tasks workerTasks = workerTasks{ch: make(chan struct {
-		client *rpc.Client
-	}),
-	}
+	var tasks workerTasks = workerTasks{}
+	var mu sync.Mutex
+
+	notifyReducerCh := make(chan struct {
+		mapTask TaskId
+		output  []string
+	})
 
 	var done bool = false
 	// This go routine will check the status of the job
@@ -120,17 +100,79 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			}
 		}
 	}(&done)
+	//waiting for finished mapTasks
+	// when do the worker process return ??
+	go func() {
+		// reducers
+		for {
+			reduceNotif := <-notifyReducerCh
+			go func() {
+				defer func() {
+					// how do we recover from crashes??
+				}()
+				for _, reducerTask := range reduceNotif.output {
+					var reduceKey int
+					var task int
+					intermediate := []KeyValue{}
+					fmt.Sscanf(reducerTask, "mr-%d-%d", &task, &reduceKey)
+					//assert task==reduceNotif.task
+					if task != int(reduceNotif.mapTask) {
+						log.Fatal("ReduceKeys Mismatch")
+					}
+					file, err := os.Open(reducerTask)
+					if err != nil {
+						log.Fatal(err)
+					}
+					dec := json.NewDecoder(file)
+					for {
+						var kv KeyValue
+						if err := dec.Decode(&kv); err != nil {
+							break
+						}
+						intermediate = append(intermediate, kv)
+					}
+					file.Close()
+					i := 0
+					for i < len(intermediate) {
+						j := i + 1 // number of key count ?
+						//compares the current and subsequent keys and increment j if they are the same
+						for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+							j++
+						}
+						values := []string{}
+						//saves them in value
+						for k := i; k < j; k++ {
+							values = append(values, intermediate[k].Value)
+						}
+						output := reducef(intermediate[i].Key, values)
+						writeTo := fmt.Sprintf("mr-out-%d", reduceKey)
+						mu.Lock()
+						ofile, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+						if err != nil {
+							log.Fatal(err)
+						}
+						fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+						mu.Unlock()
+						ofile.Close()
+						// this is the correct format for each line of Reduce output.
+						i = j
+					}
+				}
+			}()
+		}
+	}()
 
-	// Each finished map task need to tell the co-ordinator
-	// The only one that knows if the job is done is the co-ordinator
 	connRetriesMapTasks := 0
+	// Worker
 	for {
-
 		if done {
-			break
+			//till we figure when the worker process exits, as the mapTasks , reduceTasks lifecyle are tied together
+			for {
+			}
 		}
 		if connRetriesMapTasks == 5 {
-			done = true
+			for {
+			}
 		}
 		c, err := connectrpc()
 		if err != nil {
@@ -139,82 +181,65 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			// How many retries before we give up
 			continue
 		}
-		//use an idle thread or spawn a new one
-	FIND_A_THREAD:
-		tasks.mu.Lock()
-		lenIdle := tasks.idle
-		lenActive := tasks.active
-		tasks.mu.Unlock()
+		connRetriesMapTasks = 0
+		var path Task
+		taskId := len(tasks.tasks)
+		err = callrpc(c, "Coordinator.GetTask", taskId, &path)
 
-		if lenActive == activeMaxMapTasks {
-			time.Sleep(time.Second)
-			goto FIND_A_THREAD
-		} else if lenIdle != 0 {
-			// wake up exactly one sleeping worker...we can't know or tell which woke up
-			go func(client *rpc.Client) {
-				tasks.ch <- struct {
-					client *rpc.Client
-				}{
-					client,
-				}
-			}(c)
+		if err != nil {
+			c.Close()
+			fmt.Printf(fmt.Errorf("Task Id %d: %v\n", taskId, err).Error())
+			connRetriesMapTasks++
 			continue
+			// How many retries before we give up
 		}
-
-		tasks.mu.Lock()
-		tasks.addTask(workerTask{state: active})
-		tasks.incrActive()
-		tasks.mu.Unlock()
-
-		var taskId TaskId = TaskId(lenActive)
-		fmt.Printf("Spawning Client Worker Task %d\n", taskId)
-		go func(client *rpc.Client, taskId TaskId, status *bool) {
+		fmt.Printf("Spawning Map Worker Task %d\n", taskId)
+		tasks.tasks = append(tasks.tasks, workerTask{
+			payload: path,
+			state:   active,
+		})
+		go func(taskId TaskId, path Task) {
 			defer func() {
-				// we can check for crashes and handle appropiately
-				// died go routines are neither idle / active
-				tasks.mu.Lock()
-				tasks.decrIdle()
-				tasks.decrActive()
-				tasks.mu.Unlock()
+				//c.Close()
 			}()
-			for {
-				var path Task
-				err := callrpc(client, "Coordinator.GetTask", int(taskId), &path)
-				if err != nil {
-					fmt.Printf(fmt.Errorf("Task Id %d: %v\n", taskId, err).Error())
-					if err.Error() == "EEMPTY" {
-						*status = true
-					}
-					return
-				}
-				//do work with Task
-				c.Close()
-				fmt.Printf("Client Worker Task %d just finished with %s\n", taskId, path.Path)
-				// report when finished, have a service name to report task finish
-				// active -> idle
-				tasks.mu.Lock()
-				tasks.setTaskPayload(taskId, path)
-				tasks.setTaskStatus(taskId, idle)
-				tasks.incrIdle()
-				tasks.decrActive()
-				tasks.mu.Unlock()
-
-				fmt.Printf("Sleeping Client Worker Task %d\n", taskId)
-				v := <-tasks.ch
-				// woke up
-				client = v.client
-				fmt.Printf("Waking up Client Worker Task %d\n", taskId)
-				// idle -> active
-				tasks.mu.Lock()
-				tasks.setTaskStatus(taskId, active)
-				tasks.decrIdle()
-				tasks.incrActive()
-				tasks.mu.Unlock()
+			//do work with Task
+			file, err := os.Open(path.Path)
+			if err != nil {
+				log.Fatalf("cannot open %v", path.Path)
 			}
-		}(c, taskId, &done)
+			content, err := io.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", path.Path)
+			}
+			file.Close()
+			kva := mapf(path.Path, string(content))
+			sort.Sort(ByKey(kva))
+			mapReduceTasks := []string{}
+			for _, kv := range kva {
+				writeTo := fmt.Sprintf("mr-%d-%d", taskId, ihash(kv.Key)%path.ReduceTasks)
+				//create reduceTasks
+				reduceTaskFile, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+				if err != nil {
+					log.Fatalf("cannot open %v", writeTo)
+				}
+				enc := json.NewEncoder(reduceTaskFile)
+				err = enc.Encode(&kv)
+				if err != nil {
+					log.Fatalf("cannot write to buffered Key/Value Pair to %v", writeTo)
+				}
+				mapReduceTasks = append(mapReduceTasks, writeTo)
+				reduceTaskFile.Close()
+			}
+			notifyReducerCh <- struct {
+				mapTask TaskId
+				output  []string
+			}{
+				mapTask: taskId,
+				output:  mapReduceTasks,
+			}
+		}(TaskId(taskId), path)
+		c.Close()
 	}
-	// reducers
-	println("Job Done")
 
 }
 

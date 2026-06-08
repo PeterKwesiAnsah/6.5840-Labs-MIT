@@ -17,11 +17,8 @@ import (
 type Coordinator struct {
 	mu sync.Mutex //
 	// Your definitions here.
-	files    []string
-	finished struct {
-		files []string
-		count int
-	}
+	files   []string
+	nReduce int
 	pending struct {
 		files []string
 		count int
@@ -29,28 +26,29 @@ type Coordinator struct {
 }
 
 func (c *Coordinator) GetTask(arg TaskId, reply *Task) error {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    if c.pending.count == 0 {
-        return errors.New("EEMPTY")
-    }
+	if c.pending.count == 0 {
+		return errors.New("EEMPTY")
+	}
 
-    taskIndex := c.pending.count - 1
+	taskIndex := c.pending.count - 1
 
-    *reply = Task{
-        Path: c.pending.files[taskIndex],
-    }
+	*reply = Task{
+		Path:        c.pending.files[taskIndex],
+		ReduceTasks: c.nReduce,
+	}
 
-    c.pending.count--
+	c.pending.count--
 
-    fmt.Printf(
-        "Client Worker Task %d just started with %s\n",
-        arg,
-        reply.Path,
-    )
+	fmt.Printf(
+		"Client Worker Task %d just started with %s\n",
+		arg,
+		reply.Path,
+	)
 
-    return nil
+	return nil
 }
 
 func (c *Coordinator) FinishedTask(arg TaskId, reply *Task) error {
@@ -64,8 +62,8 @@ func (c *Coordinator) TStatus(arg Args, reply *TaskStatus) error {
 }
 
 func (c *Coordinator) JobStatus(arg Args, reply *JobStatus) error {
-	if c.pending.count == 0{
-		*reply=true
+	if c.pending.count == 0 {
+		*reply = true
 	}
 	return nil
 }
@@ -92,18 +90,11 @@ func (c *Coordinator) server(sockname string) {
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-// The Coordinator tellsthe worker process how many threads to use for the
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
 	c := Coordinator{files: files, pending: struct {
 		files []string
 		count int
-	}{ files: files, count: len(files)}, finished: struct {
-		files []string
-		count int
-	}{}}
-
-	// Your code here.
-
+	}{files: files, count: len(files)}, nReduce: nReduce}
 	c.server(sockname)
 	return &c
 }
