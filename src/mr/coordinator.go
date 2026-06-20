@@ -1,69 +1,167 @@
 package mr
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"os/exec"
 	"sync"
+	"time"
 )
 
-// Contains book keeping of the whole job, number of tasks completed etc
-// I think we need a mutax to lock access to the coordinator but for now we keep things simple and make iteractive client conns
-// TODO: implement a stack interface for "tasks"
-type Coordinator struct {
-	mu sync.Mutex //
-	// Your definitions here.
-	files   []string
-	nReduce int
-	pending struct {
-		files []string
-		count int
-	}
+type workerState int
+
+const (
+	in_progress workerState = iota
+	completed
+	failed
+)
+
+type taskStatus struct {
+	//workerId WorkerId
+	state workerState
+	info  WorkerInfo
 }
 
-func (c *Coordinator) GetTask(arg TaskId, reply *Task) error {
+// TODO: Read/Write locks for mTasks and rTasks
+type Coordinator struct {
+	mTasks *[][]taskStatus
+	//M
+	mInputs []string
+	//R
+	mOutput *[][]string
+	rTasks  *[][]taskStatus
+	mu      sync.Mutex
+}
+
+//TODO: Add separate locks for rTasks and mTasks
+
+var reduceTasksCnt int
+
+// It's use have a similar behavior like a sem
+var availWorkers chan int
+
+var completedMTasks int
+var completedRTasks int
+
+// in-progress
+var workers chan struct {
+	info   WorkerInfo
+	taskId int
+}
+
+// idle/non-active/nil -> in_progress
+func (c *Coordinator) GetrTask(arg WorkerInfo, reply *RTask) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// TODO: markTaskProgress
+	for reduceTask := range reduceTasksCnt {
+		rTask := (*c.rTasks)[reduceTask]
+		if rTask == nil {
+			*reply = RTask{
+				MapOutputs: (*c.mOutput)[reduceTask],
+				ReduceId:   reduceTask,
+			}
+			(*c.rTasks)[reduceTask] = []taskStatus{{info: arg, state: in_progress}}
+			workers <- struct {
+				info   WorkerInfo
+				taskId int
+			}{info: arg, taskId: reduceTask}
+			return nil
+		} else {
+			lastStatus := rTask[len(rTask)-1]
+			if lastStatus.state == failed {
+				rTask = append(rTask, taskStatus{state: in_progress, info: arg})
+				(*c.rTasks)[reduceTask] = rTask
+				*reply = RTask{
+					MapOutputs: (*c.mOutput)[reduceTask],
+					ReduceId:   reduceTask,
+				}
+				workers <- struct {
+					info   WorkerInfo
+					taskId int
+				}{info: arg, taskId: reduceTask}
+				return nil
+			}
+		}
+	}
+	// when we hit here should we let the scheduler know ??
+	//TODO; change this for backup Tasks (3.6)
+	return fmt.Errorf("All rtasks are inprogress")
+}
+
+// idle/non-active/nil -> in_progress
+func (c *Coordinator) GetmTask(arg WorkerInfo, reply *Task) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for index, inputFile := range c.mInputs {
+		mTask := (*c.mTasks)[index]
+		if mTask == nil {
+			(*c.mTasks)[index] = []taskStatus{
+				{info: arg, state: in_progress},
+			}
+			*reply = Task{
+				Path:        inputFile,
+				ReduceTasks: reduceTasksCnt,
+				TaskId:      index,
+			}
+			workers <- struct {
+				info   WorkerInfo
+				taskId int
+			}{info: arg, taskId: index}
+			return nil
+		} else {
+			lastStatus := mTask[len(mTask)-1]
+			if lastStatus.state == failed {
+				mTask = append(mTask, taskStatus{info: arg, state: in_progress})
+				(*c.mTasks)[index] = mTask
+				*reply = Task{
+					Path:        inputFile,
+					ReduceTasks: reduceTasksCnt,
+					TaskId:      index,
+				}
+				workers <- struct {
+					info   WorkerInfo
+					taskId int
+				}{info: arg, taskId: index}
+				return nil
+			}
+		}
+	}
+
+	// when we hit here should we let the scheduler know ??
+	//TODO: change this for backup Tasks (3.6)
+	return fmt.Errorf("All tasks are inprogress")
+}
+
+// in_progress -> completed
+func (c *Coordinator) Notify(arg NotifyTask, reply *ReceivedNotofication) error {
+	if reduceTasksCnt != len(arg.ReduceTasks) {
+		*reply = -1 //INSUF_RT
+		return fmt.Errorf("Expected %d but got %d", reduceTasksCnt, len(arg.ReduceTasks))
+	}
+	<-availWorkers
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.pending.count == 0 {
-		return errors.New("EEMPTY")
-	}
-
-	taskIndex := c.pending.count - 1
-
-	*reply = Task{
-		Path:        c.pending.files[taskIndex],
-		ReduceTasks: c.nReduce,
-	}
-
-	c.pending.count--
-
-	fmt.Printf(
-		"Client Worker Task %d just started with %s\n",
-		arg,
-		reply.Path,
-	)
-
-	return nil
-}
-
-func (c *Coordinator) FinishedTask(arg TaskId, reply *Task) error {
-	return nil
-}
-
-// Give status updates about finished map tasks...if a map task fails to respond for some time
-// We can give out it task
-func (c *Coordinator) TStatus(arg Args, reply *TaskStatus) error {
-	return nil
-}
-
-func (c *Coordinator) JobStatus(arg Args, reply *JobStatus) error {
-	if c.pending.count == 0 {
-		*reply = true
+	//TODO: refactor markTaskCompleted
+	completedMTasks++
+	mTask := (*c.mTasks)[arg.MapTask.TaskId]
+	mTask = append(mTask, taskStatus{info: WorkerInfo{WorkerId: int(arg.WorkerId), Type: 0}, state: completed})
+	(*c.mTasks)[arg.MapTask.TaskId] = mTask
+	*reply = 0
+	// Produce a single reduce task per partition
+	// TODO: we can schedule reduce workers from here. In the paper reduce and map workers run concurrently.
+	for index, reduceTask := range arg.ReduceTasks {
+		reduceTasks := (*c.mOutput)[index]
+		if reduceTasks == nil {
+			(*c.mOutput)[index] = make([]string, 0, reduceTasksCnt)
+			reduceTasks = (*c.mOutput)[index]
+		}
+		reduceTasks = append(reduceTasks, reduceTask)
 	}
 	return nil
 }
@@ -71,7 +169,7 @@ func (c *Coordinator) JobStatus(arg Args, reply *JobStatus) error {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.pending.count == 0
+	return false
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -90,11 +188,130 @@ func (c *Coordinator) server(sockname string) {
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
+// TODO: 3.6 (Backup Tasks)
+// TODO: 4.2 (Ordering Guarantees)
+// TODO: 4.3 (Combiner Function)
+// TODO: 4.8 (Status Information)
+// TODO: 4.9 (Counters)
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
-	c := Coordinator{files: files, pending: struct {
-		files []string
-		count int
-	}{files: files, count: len(files)}, nReduce: nReduce}
+	defer func() {
+		//remove produced files
+	}()
+
+	M := len(files)
+	reduceTasksCnt = nReduce
+	availWorkers = make(chan int, 4)
+	workers = make(chan struct {
+		info   WorkerInfo
+		taskId int
+	})
+	//0 for map
+	var phase int
+	var mapTasks [][]taskStatus = make([][]taskStatus, 0, M)
+	var mapOutput [][]string = make([][]string, 0, nReduce)
+	var reduceTasks [][]taskStatus = make([][]taskStatus, 0, nReduce)
+	c := Coordinator{mTasks: &mapTasks, rTasks: &reduceTasks, mOutput: &mapOutput, mInputs: files}
 	c.server(sockname)
+
+	//scheduler
+	go func() {
+		for {
+			availWorkers <- 1
+			args := []string{"run", "mrworker.go", "wc.so", sockname}
+			//TODO: use binaries
+			cmd := exec.Command("/usr/local/go/bin/go", args...)
+
+			cmd.Dir = ""
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if completedMTasks == M {
+				fmt.Printf("All map tasks completed, switching to reduce phase\n")
+				phase = 1
+			}
+			cmd.Env = []string{fmt.Sprintf("PHASE=%d", phase), "GOCACHE=/tmp/go-cache"}
+			cmd.Start()
+			if cmd.Process == nil {
+				<-availWorkers
+				continue
+			}
+			fmt.Printf("Started worker with PID %d for phase %d\n", cmd.Process.Pid, phase)
+		}
+	}()
+	go c.workerMonitor()
 	return &c
+}
+
+// func (c *Coordinator) markTask
+// func (c *Coordinator) markTaskProgress
+// func (c *Coordinator) markTaskFailed
+// func (c *Coordinator) markTaskCompleted
+func (c *Coordinator) markTaskFailed(typ int, taskId int, info WorkerInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var tasks *[][]taskStatus
+	if typ == 0 {
+		tasks = c.mTasks
+	} else {
+		tasks = c.rTasks
+	}
+	task := (*tasks)[taskId]
+	task = append(task, taskStatus{info: info, state: failed})
+	(*tasks)[taskId] = task
+}
+
+func (c *Coordinator) workerMonitor() {
+	for {
+		worker := <-workers
+		client, err := connectrpc(worker.info.Sockname)
+		if err != nil {
+			c.markTaskFailed(worker.info.Type, worker.taskId, worker.info)
+			continue
+		}
+		go func(client *rpc.Client, worker struct {
+			info   WorkerInfo
+			taskId int
+		}) {
+			done := make(chan *rpc.Call)
+			for {
+				timeout := time.After(10 * time.Second)
+				if worker.info.Type == 0 {
+					counts := MapCounts{}
+					client.Go("MapState.Snapshot", TaskId(worker.taskId), &counts, done)
+					select {
+					case <-timeout:
+						c.markTaskFailed(0, worker.taskId, worker.info)
+						<-availWorkers
+						return
+					case <-done:
+						{
+							fmt.Printf("Received reply message from worker Id %d with task %d", worker.info.WorkerId, worker.taskId)
+						}
+					}
+				} else {
+					counts := ReducerCounts{}
+					client.Go("ReducerState.Snapshot", worker.taskId, &counts, done)
+					select {
+					case <-timeout:
+						c.markTaskFailed(1, worker.taskId, worker.info)
+						<-availWorkers
+						return
+					case c := <-done:
+						if c.Error != nil {
+							log.Fatal("Shutting down master")
+						}
+						reply, ok := c.Reply.(*ReducerCounts)
+						if !ok {
+							//rarely the case
+							log.Fatal("Wrong reply type at RPC ReducerState.Snapshot Service")
+						}
+						fmt.Printf("Reduce task %d with worker Id %d produces %d unique intermediate keys with total %d keys processed so far", worker.taskId, worker.info.WorkerId, reply.Keys, reply.Values)
+						if reply.State == completed {
+							<-availWorkers
+						}
+					}
+				}
+				time.Sleep(1 * time.Second)
+			}
+		}(client, worker)
+	}
 }
