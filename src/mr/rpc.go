@@ -13,14 +13,32 @@ package mr
 
 type TaskId int
 type Args int
+type WorkerId int
+type WorkerInfo struct {
+	WorkerId int
+	Sockname string
+	Type     int
+}
 
 type TaskStatus bool
 type JobStatus bool
 
 type Task struct {
-	Path string
+	Path   string
+	TaskId int
 	//number of reduce Tasks to reproduce
 	ReduceTasks int
+}
+type RTask struct {
+	MapOutputs []string
+	ReduceId   int
+}
+
+type ReceivedNotofication int
+type NotifyTask struct {
+	MapTask     Task
+	WorkerId    WorkerId
+	ReduceTasks []string
 }
 
 // Add your RPC definitions here.
