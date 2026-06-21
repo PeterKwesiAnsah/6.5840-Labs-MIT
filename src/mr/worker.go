@@ -68,7 +68,7 @@ type ReducerState struct {
 
 func (ms *MapState) Snapshot(taskId TaskId, reply *MapCounts) error {
 	if taskId != TaskId(ms.task.TaskId) {
-		return fmt.Errorf("Expected %d taskId but got %d. Check state on master.", ms.task.TaskId, taskId)
+		return fmt.Errorf("Expected %d taskId but got %d. Check state on master.\n", ms.task.TaskId, taskId)
 	}
 	*reply = MapCounts{Partitions: ms.counts.Partitions}
 	return nil
@@ -81,15 +81,15 @@ func (ms *MapState) server(sockname string) {
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
-		log.Fatalf("listen error %s: %v", sockname, e)
+		log.Fatalf("listen error %s: %v\n", sockname, e)
 	}
-	fmt.Printf("Worker listening at %s\n", sockname)
+	//fmt.Printf("Worker listening at %s\n", sockname)
 	go http.Serve(l, nil)
 }
 
 func (rs *ReducerState) Snapshot(reduceId int, reply *ReducerCounts) error {
 	if reduceId != rs.reduceId {
-		return fmt.Errorf("Expected %d reduceId but got %d. Check state on master.", rs.reduceId, reduceId)
+		return fmt.Errorf("Expected %d reduceId but got %d. Check state on master.\n", rs.reduceId, reduceId)
 	}
 	*reply = rs.counts
 	if rs.counts.State == completed {
@@ -105,9 +105,9 @@ func (rs *ReducerState) server(sockname string) {
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
-		log.Fatalf("listen error %s: %v", sockname, e)
+		log.Fatalf("listen error %s: %v\n", sockname, e)
 	}
-	fmt.Printf("Worker listening at %s\n", sockname)
+	//fmt.Printf("Worker listening at %s\n", sockname)
 	go http.Serve(l, nil)
 }
 
@@ -128,6 +128,8 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			return
 		}
 		ms := MapState{}
+		// for heartbeat messages between coordinator and worker
+		func() { ms.server(workerSockName) }()
 
 		err = callrpc(c, "Coordinator.GetmTask", WorkerInfo{
 			WorkerId: os.Getpid(),
@@ -139,8 +141,6 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			fmt.Printf(fmt.Errorf("Worker Id %d: %v\n", ms.task.TaskId, err).Error())
 			return
 		}
-		// for heartbeat messages between coordinator and worker
-		go func() { ms.server(workerSockName) }()
 		//do work with Task
 		file, err := os.Open(ms.task.Path)
 		if err != nil {
@@ -161,7 +161,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			//open file ms.task.ReduceTasks times
 			fp, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 			if err != nil {
-				log.Fatalf("cannot open %v", writeTo)
+				log.Fatalf("cannot open %v\n", writeTo)
 			}
 			ms.mapReduceTasks = append(ms.mapReduceTasks, writeTo)
 			fps = append(fps, fp)
@@ -176,7 +176,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			enc := json.NewEncoder(fp)
 			err = enc.Encode(&kv)
 			if err != nil {
-				log.Fatalf("cannot write to buffered Key/Value Pair to %v", writeTo)
+				log.Fatalf("cannot write to buffered Key/Value Pair to %v\n", writeTo)
 			}
 		}
 
@@ -188,7 +188,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		}, &reply)
 
 		if err != nil {
-			fmt.Printf(fmt.Errorf("Worker Id %d: %v\n", ms.task.TaskId, err).Error())
+			fmt.Printf("Worker %d failed to Notify Task %d: %v\n", os.Getpid(),ms.task.TaskId, err)
 			return
 		}
 
@@ -200,21 +200,27 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			return
 		}
 
+		// store Task in rs just like the map
 		var task RTask
-
+		// for heartbeat messages between coordinator and worker
+		rs := ReducerState{intermediate: []KeyValue{}}
+		func() { rs.server(workerSockName) }()
+		
 		err = callrpc(c, "Coordinator.GetrTask", WorkerInfo{
 			WorkerId: os.Getpid(),
 			Type:     1,
 			Sockname: workerSockName,
 		}, &task)
+		
 		c.Close()
+		
 		if err != nil {
 			fmt.Printf(fmt.Errorf("Worker Id %d: %v\n", task.ReduceId, err).Error())
 			return
 		}
-		rs := ReducerState{intermediate: []KeyValue{}}
-		// for heartbeat messages between coordinator and worker
-		go func() { rs.server(workerSockName) }()
+		rs.reduceId=task.ReduceId
+		
+		//fmt.Println(task.MapOutputs)
 		//per mapTask
 		for _, reducerTask := range task.MapOutputs {
 			file, err := os.Open(reducerTask)
@@ -236,6 +242,11 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		i := 0
 		writeTo := fmt.Sprintf("mr-out-%d", task.ReduceId)
 		ofile, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+
+		if err!=nil{
+			log.Fatal("Failed to open file\n")
+		}
+		
 		for i < len(rs.intermediate) {
 			j := i + 1 // number of key count ?
 			//compares the current and subsequent keys and increment j if they are the same
@@ -250,9 +261,6 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			output := reducef(rs.intermediate[i].Key, values)
 			rs.counts.Keys++
 			rs.counts.Values += len(values)
-			if err != nil {
-				log.Fatal(err)
-			}
 			fmt.Fprintf(ofile, "%v %v\n", rs.intermediate[i].Key, output)
 			// this is the correct format for each line of Reduce output.
 			i = j
