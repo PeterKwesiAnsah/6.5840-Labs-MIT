@@ -38,12 +38,13 @@ type Coordinator struct {
 }
 
 var reduceTasksCnt int
+var coordinatorTasks = 0
 
 // It's use have a similar behavior like a sem
 var availWorkers chan int
 
-var completedMTasks int
-var completedRTasks int
+var completedMTasks chan int
+var completedRTasks chan int
 
 // in-progress
 var workers chan struct {
@@ -130,7 +131,7 @@ func (c *Coordinator) GetmTask(arg WorkerInfo, reply *Task) error {
 		}
 	}
 
-	// when we hit here should we let the scheduler know ??
+	// when we hit here should we let the scheduler know ?? Yes
 	//TODO: change this for backup Tasks (3.6)
 	return fmt.Errorf("All tasks are inprogress\n")
 }
@@ -141,12 +142,13 @@ func (c *Coordinator) Notify(arg NotifyTask, reply *ReceivedNotofication) error 
 		*reply = -1 //INSUF_RT
 		return fmt.Errorf("Expected %d but got %d\n", reduceTasksCnt, len(arg.ReduceTasks))
 	}
+
 	<-availWorkers
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	//TODO: refactor markTaskCompleted
-	completedMTasks++
+	//completedMTasks++
 	mTask := (*c.mTasks)[arg.MapTask.TaskId]
 	mTask = append(mTask, taskStatus{info: WorkerInfo{WorkerId: int(arg.WorkerId), Type: 0}, state: completed})
 	(*c.mTasks)[arg.MapTask.TaskId] = mTask
@@ -160,7 +162,7 @@ func (c *Coordinator) Notify(arg NotifyTask, reply *ReceivedNotofication) error 
 			reduceTasks = (*c.mOutput)[index]
 		}
 		reduceTasks = append(reduceTasks, reduceTask)
-		(*c.mOutput)[index]=reduceTasks
+		(*c.mOutput)[index] = reduceTasks
 	}
 	return nil
 }
@@ -168,6 +170,11 @@ func (c *Coordinator) Notify(arg NotifyTask, reply *ReceivedNotofication) error 
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
+	if coordinatorTasks == reduceTasksCnt {
+		return true
+	}
+	<-completedRTasks
+	coordinatorTasks++
 	return false
 }
 
@@ -200,6 +207,8 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	}()
 
 	M := len(files)
+	completedMTasks = make(chan int, M)
+	completedRTasks = make(chan int, nReduce)
 	reduceTasksCnt = nReduce
 	availWorkers = make(chan int, 4)
 	workers = make(chan struct {
@@ -208,14 +217,15 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	})
 	//0 for map
 	var phase int
-	var mapTasks [][]taskStatus = make([][]taskStatus,M)
-	var mapOutput [][]string = make([][]string,nReduce)
-	var reduceTasks [][]taskStatus = make([][]taskStatus,nReduce)
+	var mapTasks [][]taskStatus = make([][]taskStatus, M)
+	var mapOutput [][]string = make([][]string, nReduce)
+	var reduceTasks [][]taskStatus = make([][]taskStatus, nReduce)
 	c := Coordinator{mTasks: &mapTasks, rTasks: &reduceTasks, mOutput: &mapOutput, mInputs: files}
 	c.server(sockname)
 
 	//scheduler
 	go func() {
+		//local completedMTasks and completedRTasks..one thread have access, no locks
 		for {
 			availWorkers <- 1
 			args := []string{"wc.so", sockname}
@@ -223,10 +233,6 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 			cmd := exec.Command("./mrworker", args...)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
-			if completedMTasks == M {
-				//fmt.Printf("All map tasks completed, switching to reduce phase\n")
-				phase = 1
-			}
 			cmd.Env = []string{fmt.Sprintf("PHASE=%d", phase), "GOCACHE=/tmp/go-cache"}
 			if err := cmd.Start(); err != nil {
 				log.Fatal(err)
@@ -271,7 +277,7 @@ func (c *Coordinator) workerMonitor() {
 			info   WorkerInfo
 			taskId int
 		}) {
-			done := make(chan *rpc.Call,1)
+			done := make(chan *rpc.Call, 1)
 			for {
 				timeout := time.After(10 * time.Second)
 				if worker.info.Type == 0 {
@@ -296,7 +302,7 @@ func (c *Coordinator) workerMonitor() {
 						return
 					case c := <-done:
 						if c.Error != nil {
-							log.Fatalf("Shutting down master from workerMonitor on a reduce Task %v\n",c.Error)
+							log.Fatalf("Shutting down master from workerMonitor on a reduce Task %v\n", c.Error)
 							// TODO: c.markTaskFailed
 						}
 						reply, ok := c.Reply.(*ReducerCounts)
@@ -306,8 +312,10 @@ func (c *Coordinator) workerMonitor() {
 						}
 						fmt.Printf("Reduce task %d with worker Id %d produces %d unique intermediate keys with total %d keys processed so far\n", worker.taskId, worker.info.WorkerId, reply.Keys, reply.Values)
 						if reply.State == completed {
-							<-availWorkers
-						fmt.Printf("Reduce task %d with worker Id %d produces %d unique intermediate keys with total %d keys processed so far\n", worker.taskId, worker.info.WorkerId, reply.Keys, reply.Values)
+							completedRTasks <- worker.taskId
+							//send 1 to channel
+							<-availWorkers // Consumed Workers returning
+							fmt.Printf("Reduce task %d with worker Id %d produces %d unique intermediate keys with total %d keys processed so far\n", worker.taskId, worker.info.WorkerId, reply.Keys, reply.Values)
 							return
 						}
 					}
