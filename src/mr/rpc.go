@@ -15,7 +15,7 @@ type TaskId int
 type Args int
 type WorkerId int
 type WorkerInfo struct {
-	WorkerId int
+	WorkerId WorkerId
 	Sockname string
 	Type     int
 }
