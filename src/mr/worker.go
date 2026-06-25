@@ -41,6 +41,7 @@ var waitTilDone chan bool
 
 type MapCounts struct {
 	Partitions int
+	State      workerState
 }
 
 // MapState
@@ -71,6 +72,9 @@ func (ms *MapState) Snapshot(taskId TaskId, reply *MapCounts) error {
 		return fmt.Errorf("Expected %d taskId but got %d. Check state on master.\n", ms.task.TaskId, taskId)
 	}
 	*reply = MapCounts{Partitions: ms.counts.Partitions}
+	if ms.counts.State == completed {
+		waitTilDone <- true
+	}
 	return nil
 }
 
@@ -83,7 +87,6 @@ func (ms *MapState) server(sockname string) {
 	if e != nil {
 		log.Fatalf("listen error %s: %v\n", sockname, e)
 	}
-	//fmt.Printf("Worker listening at %s\n", sockname)
 	go http.Serve(l, nil)
 }
 
@@ -132,7 +135,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		func() { ms.server(workerSockName) }()
 
 		err = callrpc(c, "Coordinator.GetmTask", WorkerInfo{
-			WorkerId: os.Getpid(),
+			WorkerId: WorkerId(os.Getpid()),
 			Type:     0,
 			Sockname: workerSockName,
 		}, &ms.task)
@@ -158,7 +161,6 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 		for partition := range ms.task.ReduceTasks {
 			writeTo := fmt.Sprintf("mr-%d-%d", ms.task.TaskId, partition)
-			//open file ms.task.ReduceTasks times
 			fp, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 			if err != nil {
 				log.Fatalf("cannot open %v\n", writeTo)
@@ -188,10 +190,11 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		}, &reply)
 
 		if err != nil {
-			fmt.Printf("Worker %d failed to Notify Task %d: %v\n", os.Getpid(),ms.task.TaskId, err)
+			fmt.Printf("Worker %d failed to Notify Task %d: %v\n", os.Getpid(), ms.task.TaskId, err)
 			return
 		}
-
+		ms.counts.State = completed
+		<-waitTilDone
 	} else {
 		fmt.Printf("Starting worker in reduce phase with PID %d\n", os.Getpid())
 		c, err := connectrpc(coordSockName)
@@ -205,21 +208,21 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		// for heartbeat messages between coordinator and worker
 		rs := ReducerState{intermediate: []KeyValue{}}
 		func() { rs.server(workerSockName) }()
-		
+
 		err = callrpc(c, "Coordinator.GetrTask", WorkerInfo{
-			WorkerId: os.Getpid(),
+			WorkerId: WorkerId(os.Getpid()),
 			Type:     1,
 			Sockname: workerSockName,
 		}, &task)
-		
+
 		c.Close()
-		
+
 		if err != nil {
 			fmt.Printf(fmt.Errorf("Worker Id %d: %v\n", task.ReduceId, err).Error())
 			return
 		}
-		rs.reduceId=task.ReduceId
-		
+		rs.reduceId = task.ReduceId
+
 		//fmt.Println(task.MapOutputs)
 		//per mapTask
 		for _, reducerTask := range task.MapOutputs {
@@ -243,10 +246,10 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		writeTo := fmt.Sprintf("mr-out-%d", task.ReduceId)
 		ofile, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 
-		if err!=nil{
+		if err != nil {
 			log.Fatal("Failed to open file\n")
 		}
-		
+
 		for i < len(rs.intermediate) {
 			j := i + 1 // number of key count ?
 			//compares the current and subsequent keys and increment j if they are the same
