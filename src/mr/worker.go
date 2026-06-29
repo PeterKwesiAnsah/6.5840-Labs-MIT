@@ -40,8 +40,8 @@ var workerSockName string
 var waitTilDone chan bool
 
 type MapCounts struct {
-	Partitions int
-	State      workerState
+	//Partitions int
+	State workerState
 }
 
 // MapState
@@ -71,7 +71,7 @@ func (ms *MapState) Snapshot(taskId TaskId, reply *MapCounts) error {
 	if taskId != TaskId(ms.task.TaskId) {
 		return fmt.Errorf("Expected %d taskId but got %d. Check state on master.\n", ms.task.TaskId, taskId)
 	}
-	*reply = MapCounts{Partitions: ms.counts.Partitions}
+	*reply = ms.counts
 	if ms.counts.State == completed {
 		waitTilDone <- true
 	}
@@ -133,7 +133,6 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		ms := MapState{}
 		// for heartbeat messages between coordinator and worker
 		func() { ms.server(workerSockName) }()
-
 		err = callrpc(c, "Coordinator.GetmTask", WorkerInfo{
 			WorkerId: WorkerId(os.Getpid()),
 			Type:     0,
@@ -147,11 +146,11 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		//do work with Task
 		file, err := os.Open(ms.task.Path)
 		if err != nil {
-			log.Fatalf("cannot open %v", ms.task.Path)
+			log.Fatalf("cannot open %v\n", ms.task.Path)
 		}
 		content, err := io.ReadAll(file)
 		if err != nil {
-			log.Fatalf("cannot read %v", ms.task.Path)
+			log.Fatalf("cannot read %v\n", ms.task.Path)
 		}
 		file.Close()
 		kva := mapf(ms.task.Path, string(content))
